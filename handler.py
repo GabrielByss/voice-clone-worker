@@ -44,6 +44,11 @@ import urllib.request
 
 import numpy as np
 
+import faulthandler
+
+faulthandler.enable()  # traceback C-poziomu przy segfaulcie (zamiast cichego zgonu kontenera)
+print("[voice-worker] python started", flush=True)
+
 MODE = os.environ.get("VOICE_MODE", "serverless").strip().lower()
 OUTPUT_DIR = os.environ.get("VOICE_OUTPUT_DIR", "/tmp/voice-output")
 VOXCPM_ID = os.environ.get("VOICE_VOXCPM_MODEL_ID", "openbmb/VoxCPM2").strip()
@@ -94,14 +99,25 @@ if BAKED and not os.environ.get("HF_HUB_OFFLINE"):
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 BOOT_T0 = time.time()
+BOOT_ERROR: str | None = None  # gdy ustawione: worker startuje (żeby było widać logi/ping), ale każde zlecenie zwraca błąd
+STRICT_BOOT = env_bool("VOICE_STRICT_BOOT", False)
 
-import torch  # noqa: E402
+try:
+    import torch  # noqa: E402
 
-if not torch.cuda.is_available():
-    raise RuntimeError("Voice worker wymaga CUDA (torch.cuda.is_available() == False)")
+    log(f"torch {torch.__version__} imported in {time.time() - BOOT_T0:.1f}s, cuda_available={torch.cuda.is_available()}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("Voice worker wymaga CUDA (torch.cuda.is_available() == False)")
+    VRAM_GB = torch.cuda.get_device_properties(0).total_memory / 1e9
+    GPU_NAME = torch.cuda.get_device_name(0)
+except Exception as exc:  # pragma: no cover
+    torch = None  # type: ignore
+    VRAM_GB, GPU_NAME = 0.0, "n/a"
+    BOOT_ERROR = f"{type(exc).__name__}: {exc}"
+    log("BOOT ERROR (torch/cuda): " + traceback.format_exc())
+    if STRICT_BOOT:
+        raise
 
-VRAM_GB = torch.cuda.get_device_properties(0).total_memory / 1e9
-GPU_NAME = torch.cuda.get_device_name(0)
 log(f"boot: gpu={GPU_NAME} vram={VRAM_GB:.1f}GB engines={sorted(ENGINES_ENABLED)} preload={PRELOAD_RAW} "
     f"offline={os.environ.get('HF_HUB_OFFLINE', '0')} hf_home={os.environ.get('HF_HOME', '')}")
 
@@ -153,14 +169,24 @@ def get_model(engine: str):
     return _MODELS[engine]
 
 
-# Preload przy starcie (domyślnie oba) – błąd ładowania ma zatrzymać workera od razu.
+# Preload przy starcie (domyślnie oba). Błąd ładowania: przy VOICE_STRICT_BOOT=true worker pada, inaczej startuje
+# z BOOT_ERROR (widoczny w logach i w ping), a zlecenia zwracają błąd zamiast wisieć w kolejce.
 _preload = set() if PRELOAD_RAW in {"", "none", "false", "0"} else (
     set(ENGINES_ENABLED) if PRELOAD_RAW == "all" else {e.strip() for e in PRELOAD_RAW.split(",") if e.strip()})
-for _eng in sorted(_preload):
-    if _eng in ENGINES_ENABLED:
-        get_model(_eng)
-log(f"boot done in {time.time() - BOOT_T0:.1f}s, loaded={sorted(_MODELS)}, "
-    f"vram_used={torch.cuda.memory_allocated() / 1e9:.1f}GB")
+if BOOT_ERROR is None:
+    for _eng in sorted(_preload):
+        if _eng not in ENGINES_ENABLED:
+            continue
+        try:
+            get_model(_eng)
+        except Exception as exc:  # pragma: no cover
+            BOOT_ERROR = f"{_eng}: {type(exc).__name__}: {exc}"
+            log(f"BOOT ERROR ({_eng}): " + traceback.format_exc())
+            if STRICT_BOOT:
+                raise
+            break
+_vram_used = torch.cuda.memory_allocated() / 1e9 if torch is not None else 0.0
+log(f"boot done in {time.time() - BOOT_T0:.1f}s, loaded={sorted(_MODELS)}, vram_used={_vram_used:.1f}GB, boot_error={BOOT_ERROR}")
 
 
 # --------------------------------------------------------------------------------------
@@ -369,19 +395,25 @@ def generate(inp: dict, job_id: str) -> dict:
 def handler(job: dict) -> dict:
     inp = job.get("input") or {}
     if inp.get("ping"):
-        return {
-            "ok": True, "engines": sorted(ENGINES_ENABLED), "loaded": sorted(_MODELS), "gpu": GPU_NAME,
-            "vram_gb": round(VRAM_GB, 1), "vram_used_gb": round(torch.cuda.memory_allocated() / 1e9, 2),
-            "uptime_s": round(time.time() - BOOT_T0, 1),
+        out = {
+            "ok": BOOT_ERROR is None, "engines": sorted(ENGINES_ENABLED), "loaded": sorted(_MODELS), "gpu": GPU_NAME,
+            "vram_gb": round(VRAM_GB, 1), "uptime_s": round(time.time() - BOOT_T0, 1),
         }
+        if torch is not None:
+            out["vram_used_gb"] = round(torch.cuda.memory_allocated() / 1e9, 2)
+        if BOOT_ERROR:
+            out["boot_error"] = BOOT_ERROR
+        return out
+    if BOOT_ERROR:
+        return {"error": f"worker boot failed: {BOOT_ERROR}"}
     try:
         return generate(inp, str(job.get("id") or f"local-{int(time.time())}"))
     except ValueError as exc:
         return {"error": str(exc)}
-    except torch.cuda.OutOfMemoryError as exc:  # pragma: no cover
-        torch.cuda.empty_cache()
-        return {"error": f"CUDA OOM ({VRAM_GB:.0f} GB VRAM): {exc}"}
     except Exception as exc:  # pragma: no cover
+        if torch is not None and isinstance(exc, torch.cuda.OutOfMemoryError):
+            torch.cuda.empty_cache()
+            return {"error": f"CUDA OOM ({VRAM_GB:.0f} GB VRAM): {exc}"}
         log(traceback.format_exc())
         return {"error": f"{type(exc).__name__}: {exc}"}
 

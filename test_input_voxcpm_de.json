@@ -1,0 +1,11 @@
+{
+  "input": {
+    "engine": "voxcpm2",
+    "text": "Hallo, hier bin ich. Nimm bitte ab, ich habe großartige Neuigkeiten und kann es kaum erwarten, dir alles zu erzählen.",
+    "language": "de",
+    "ref_audio_url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav",
+    "ref_text": "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you.",
+    "audio_format": "mp3",
+    "return_base64": true
+  }
+}

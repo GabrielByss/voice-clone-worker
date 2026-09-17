@@ -1,0 +1,10 @@
+{
+  "input": {
+    "engine": "qwen3tts",
+    "text": "Hey, it's me. Pick up the phone, I've got some great news and I can't wait to tell you all about it.",
+    "language": "en",
+    "ref_audio_url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav",
+    "audio_format": "mp3",
+    "return_base64": true
+  }
+}

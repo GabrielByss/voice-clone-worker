@@ -1,0 +1,11 @@
+{
+  "input": {
+    "engine": "voxcpm2",
+    "text": "Hey, it's me. Pick up the phone, I've got some great news and I can't wait to tell you all about it.",
+    "language": "en",
+    "ref_audio_url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav",
+    "ref_text": "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you.",
+    "audio_format": "mp3",
+    "return_base64": true
+  }
+}

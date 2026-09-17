@@ -150,9 +150,15 @@ def _load_qwen():
     from qwen_tts import Qwen3TTSModel
 
     attn = os.environ.get("QWEN_ATTN", "sdpa").strip() or "sdpa"
-    # id repo (nie ścieżka): qwen_tts sam dociąga speech_tokenizer przez snapshot_download i honoruje HF_HUB_OFFLINE
-    model = Qwen3TTSModel.from_pretrained(QWEN_ID, device_map="cuda:0", dtype=torch.bfloat16, attn_implementation=attn)
-    log(f"qwen3tts loaded ({QWEN_ID}, attn={attn})")
+    # Ładujemy z LOKALNEGO katalogu snapshotu, nie z id repo: qwen_tts woła AutoProcessor.from_pretrained(..., fix_mistral_regex=True),
+    # a transformers 4.57 dla nie-lokalnej ścieżki pyta API HF (model_info) o tokenizer Mistrala – pod HF_HUB_OFFLINE=1 to wyjątek
+    # (incydent v1 2026-09-17: worker w pętli restartów). Dla katalogu qwen_tts pomija też snapshot_download speech_tokenizera
+    # i czyta speech_tokenizer/config.json przez cached_file z dysku.
+    src = (_snapshot_dir(QWEN_ID) if BAKED else None) or QWEN_ID
+    if BAKED and not os.path.isdir(src):
+        raise RuntimeError(f"Brak snapshotu {QWEN_ID} w cache HF ({os.environ.get('HF_HOME')}); offline load niemożliwy")
+    model = Qwen3TTSModel.from_pretrained(src, device_map="cuda:0", dtype=torch.bfloat16, attn_implementation=attn)
+    log(f"qwen3tts loaded from {src} (attn={attn})")
     return model
 
 

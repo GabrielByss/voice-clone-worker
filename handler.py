@@ -11,8 +11,8 @@ ACE-Step / MiniMax (audio_base64 | upload_url), żeby backend finalizował joby 
 Wejście (job["input"]):
   engine            str   "voxcpm2" | "qwen3tts"                                        [wymagane]
   text              str   tekst do przeczytania, <= VOICE_MAX_TEXT_CHARS (1000)          [wymagane]
-  language          str   kod ISO ("en", "de", "fr", ...). VoxCPM2 wykrywa język sam; Qwen dostaje nazwę
-                          języka z mapy QWEN_LANGUAGES, nieznany kod => "Auto"          domyślnie "en"
+  language          str   kod ISO ("en", "de", "fr", ...) albo "auto". VoxCPM2 wykrywa język sam (pole tylko
+                          w metadanych); Qwen dostaje nazwę z mapy QWEN_LANGUAGES, "auto"/nieznany => "Auto"   domyślnie "en"
   ref_audio_base64  str   próbka głosu (wav/mp3/m4a, dowolna częstotliwość)              jedno z dwóch
   ref_audio_url     str   URL próbki (HTTPS)                                             wymagane
   ref_text          str   transkrypcja próbki; jeśli podana, oba silniki używają trybu wierniejszego
@@ -27,8 +27,8 @@ Wejście (job["input"]):
   ping              bool  health-check: zwraca gpu, vram, załadowane silniki
 
 Wyjście: audio_base64? | audio_url?, format, mime, sample_rate, duration, size_bytes, engine, model, attribution,
-         language, ref_mode ("transcript" | "reference_only"), ref_seconds, text_chars, seed, generation_seconds,
-         uploaded, upload_status?
+         language, ref_mode ("transcript" | "reference_only" | "reference_only_fallback"), ref_seconds, text_chars, seed,
+         generation_seconds, short_output_retries (ile razy wynik był za krótki i generacja poszła ponownie), uploaded, upload_status?
 """
 from __future__ import annotations
 
@@ -89,6 +89,10 @@ def env_float(name: str, default: float) -> float:
 
 BAKED = env_bool("VOICE_BAKED", True)
 MAX_TEXT_CHARS = int(env_float("VOICE_MAX_TEXT_CHARS", 1000))
+# Ochrona przed uciętym wyjściem (incydent 2026-09-18: 112 znaków tekstu → 1,4 s audio, bo transkrypcja próbki była błędna):
+# poniżej len(text)/VOICE_MAX_CHARS_PER_SEC sekund powtarzamy z nowym seedem, ostatnia próba bez transkrypcji (reference only).
+MAX_CHARS_PER_SEC = env_float("VOICE_MAX_CHARS_PER_SEC", 30.0)
+SHORT_OUTPUT_RETRIES = int(env_float("VOICE_SHORT_OUTPUT_RETRIES", 2))
 REF_MAX_SECONDS = env_float("VOICE_REF_MAX_SECONDS", 30.0)
 REF_MAX_BYTES = int(env_float("VOICE_REF_MAX_MB", 25.0) * 1024 * 1024)
 ENGINES_ENABLED = {e.strip().lower() for e in os.environ.get("VOICE_ENGINES", "voxcpm2,qwen3tts").split(",") if e.strip()}
@@ -343,6 +347,11 @@ def encode(audio: np.ndarray, sr: int, req: dict, work_dir: str) -> tuple[bytes,
         return fh.read(), "mp3"
 
 
+def _expected_min_seconds(text: str) -> float:
+    """Najkrótsze wiarygodne audio dla tekstu: bardzo szybka mowa to ~30 znaków/s; krótsze wyjście = model uciął generację."""
+    return max(0.8, len(text) / max(5.0, MAX_CHARS_PER_SEC))
+
+
 def generate(inp: dict, job_id: str) -> dict:
     req = build_request(inp)
     model = get_model(req["engine"])
@@ -354,8 +363,22 @@ def generate(inp: dict, job_id: str) -> dict:
         log(f"job {job_id}: engine={req['engine']} lang={req['language']} text_chars={len(req['text'])} "
             f"ref={ref_seconds:.1f}s mode={ref_mode} seed={req['seed']}")
         t0 = time.time()
-        audio, sr = RUNNERS[req["engine"]](model, req, ref_path)
-        audio = to_mono_1d(audio)
+        min_seconds = _expected_min_seconds(req["text"])
+        short_retries = 0
+        while True:
+            audio, sr = RUNNERS[req["engine"]](model, req, ref_path)
+            audio = to_mono_1d(audio)
+            got = audio.shape[0] / sr
+            if got >= min_seconds or short_retries >= SHORT_OUTPUT_RETRIES:
+                break
+            short_retries += 1
+            if short_retries == SHORT_OUTPUT_RETRIES and req["ref_text"]:
+                # Zła / niepasująca transkrypcja próbki to najczęstsza przyczyna – ostatnia próba bez niej.
+                req["ref_text"] = None
+                ref_mode = "reference_only_fallback"
+            req["seed"] = int.from_bytes(os.urandom(4), "little")
+            log(f"job {job_id}: output too short ({got:.2f}s < {min_seconds:.2f}s for {len(req['text'])} chars) – "
+                f"retry {short_retries}/{SHORT_OUTPUT_RETRIES} mode={ref_mode} seed={req['seed']}")
         elapsed = time.time() - t0
         if audio.shape[0] < sr // 10:
             raise RuntimeError("Model zwrócił pusty dźwięk.")
@@ -377,6 +400,7 @@ def generate(inp: dict, job_id: str) -> dict:
             "text_chars": len(req["text"]),
             "seed": req["seed"],
             "generation_seconds": round(elapsed, 3),
+            "short_output_retries": short_retries,
             "uploaded": False,
         }
         upload_url = inp.get("upload_url")
